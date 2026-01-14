@@ -1,0 +1,1 @@
+Claude changes the font when run in WSL. Maybe look into using vscode instead for a better experiance.
