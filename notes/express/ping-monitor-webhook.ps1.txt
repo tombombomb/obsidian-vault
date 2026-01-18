@@ -1,0 +1,221 @@
+# ping-monitor-webhook.ps1
+# Monitors a host and sends webhook alert after consecutive ping failures
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Webhook URL - change this to your webhook endpoint
+$webhookUrl = "http://localhost:3000/webhook/ping-alert"
+
+# Host to monitor - can be IP address or hostname
+$targetHost = "8.8.8.8"  # Google DNS as example
+
+# Number of consecutive failures before sending alert
+$failureThreshold = 10
+
+# Delay between ping attempts (in seconds)
+$pingInterval = 5
+
+# Timeout for each ping (in milliseconds)
+$pingTimeout = 1000
+
+# ============================================================================
+# SCRIPT VARIABLES (Don't modify)
+# ============================================================================
+
+$consecutiveFailures = 0
+$totalPings = 0
+$totalFailures = 0
+$lastSuccessTime = Get-Date
+$alertSent = $false
+$scriptStartTime = Get-Date
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+function Send-WebhookAlert {
+    param(
+        [int]$failureCount,
+        [string]$host,
+        [datetime]$lastSuccess
+    )
+    
+    $timeSinceLastSuccess = (Get-Date) - $lastSuccess
+    $uptime = (Get-Date) - $scriptStartTime
+    
+    $payload = @{
+        eventType = "ping_failure_alert"
+        severity = "critical"
+        timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
+        host = $host
+        computer = $env:COMPUTERNAME
+        consecutiveFailures = $failureCount
+        failureThreshold = $failureThreshold
+        lastSuccessfulPing = $lastSuccess.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        timeSinceLastSuccess = @{
+            totalSeconds = [math]::Round($timeSinceLastSuccess.TotalSeconds, 0)
+            humanReadable = "{0:hh\:mm\:ss}" -f $timeSinceLastSuccess
+        }
+        statistics = @{
+            totalPings = $totalPings
+            totalFailures = $totalFailures
+            failureRate = [math]::Round(($totalFailures / $totalPings) * 100, 2)
+            monitoringDuration = @{
+                totalSeconds = [math]::Round($uptime.TotalSeconds, 0)
+                humanReadable = "{0:hh\:mm\:ss}" -f $uptime
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+    
+    try {
+        $response = Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $payload -ContentType "application/json" -TimeoutSec 10
+        Write-Host "[ALERT SENT] $failureCount consecutive failures to $host" -ForegroundColor Red
+        Write-Host "Webhook response: $($response | ConvertTo-Json -Compress)" -ForegroundColor Yellow
+        return $true
+    }
+    catch {
+        Write-Host "[WEBHOOK FAILED] Could not send alert: $_" -ForegroundColor Red
+        # Log error to file
+        $errorLog = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Webhook Error: $_"
+        $errorLog | Out-File -Append -FilePath "ping-monitor-errors.log"
+        return $false
+    }
+}
+
+function Send-RecoveryWebhook {
+    param(
+        [string]$host,
+        [int]$downtimeDuration
+    )
+    
+    $payload = @{
+        eventType = "ping_recovery"
+        severity = "info"
+        timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
+        host = $host
+        computer = $env:COMPUTERNAME
+        message = "Host has recovered and is now responding to pings"
+        downtimeDuration = @{
+            totalSeconds = $downtimeDuration
+            humanReadable = "{0:hh\:mm\:ss}" -f ([TimeSpan]::FromSeconds($downtimeDuration))
+        }
+    } | ConvertTo-Json -Depth 10
+    
+    try {
+        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $payload -ContentType "application/json" -TimeoutSec 10
+        Write-Host "[RECOVERY] Host $host is back online" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "[WEBHOOK FAILED] Could not send recovery notification: $_" -ForegroundColor Red
+    }
+}
+
+function Test-HostPing {
+    param([string]$hostname)
+    
+    try {
+        $ping = Test-Connection -ComputerName $hostname -Count 1 -Timeout ($pingTimeout / 1000) -ErrorAction Stop
+        return @{
+            Success = $true
+            ResponseTime = $ping.ResponseTime
+            IPAddress = $ping.IPV4Address.IPAddressToString
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            ResponseTime = $null
+            IPAddress = $null
+        }
+    }
+}
+
+# ============================================================================
+# MAIN MONITORING LOOP
+# ============================================================================
+
+Write-Host "===============================================" -ForegroundColor Cyan
+Write-Host "    PING MONITOR - WEBHOOK ALERTING" -ForegroundColor Cyan
+Write-Host "===============================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Target Host:       $targetHost" -ForegroundColor White
+Write-Host "Failure Threshold: $failureThreshold consecutive failures" -ForegroundColor White
+Write-Host "Ping Interval:     $pingInterval seconds" -ForegroundColor White
+Write-Host "Ping Timeout:      $pingTimeout ms" -ForegroundColor White
+Write-Host "Webhook URL:       $webhookUrl" -ForegroundColor White
+Write-Host ""
+Write-Host "Press Ctrl+C to stop monitoring" -ForegroundColor Yellow
+Write-Host "===============================================" -ForegroundColor Cyan
+Write-Host ""
+
+try {
+    while ($true) {
+        $totalPings++
+        $timestamp = Get-Date -Format "HH:mm:ss"
+        
+        # Perform ping test
+        $result = Test-HostPing -hostname $targetHost
+        
+        if ($result.Success) {
+            # Ping successful
+            $consecutiveFailures = 0
+            $lastSuccessTime = Get-Date
+            
+            # If we previously sent an alert and now recovered, send recovery notification
+            if ($alertSent) {
+                $downtimeSeconds = ((Get-Date) - $lastSuccessTime).TotalSeconds
+                Send-RecoveryWebhook -host $targetHost -downtimeDuration $downtimeSeconds
+                $alertSent = $false
+            }
+            
+            Write-Host "[$timestamp] ✓ PING SUCCESS - $targetHost - Response: $($result.ResponseTime)ms - IP: $($result.IPAddress)" -ForegroundColor Green
+        }
+        else {
+            # Ping failed
+            $consecutiveFailures++
+            $totalFailures++
+            
+            Write-Host "[$timestamp] ✗ PING FAILED  - $targetHost - Consecutive failures: $consecutiveFailures/$failureThreshold" -ForegroundColor Red
+            
+            # Check if we've reached the threshold
+            if ($consecutiveFailures -ge $failureThreshold -and -not $alertSent) {
+                Send-WebhookAlert -failureCount $consecutiveFailures -host $targetHost -lastSuccess $lastSuccessTime
+                $alertSent = $true
+            }
+            elseif ($consecutiveFailures -ge $failureThreshold -and $alertSent) {
+                # Already sent alert, just show status
+                Write-Host "         Alert already sent. Host still down ($consecutiveFailures failures)" -ForegroundColor Yellow
+            }
+        }
+        
+        # Display statistics every 10 pings
+        if ($totalPings % 10 -eq 0) {
+            $failureRate = if ($totalPings -gt 0) { [math]::Round(($totalFailures / $totalPings) * 100, 2) } else { 0 }
+            Write-Host ""
+            Write-Host "--- Statistics (Total Pings: $totalPings) ---" -ForegroundColor Cyan
+            Write-Host "Total Failures: $totalFailures | Failure Rate: $failureRate% | Consecutive: $consecutiveFailures" -ForegroundColor Cyan
+            Write-Host ""
+        }
+        
+        # Wait before next ping
+        Start-Sleep -Seconds $pingInterval
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "Script terminated: $_" -ForegroundColor Yellow
+}
+finally {
+    Write-Host ""
+    Write-Host "===============================================" -ForegroundColor Cyan
+    Write-Host "Monitoring stopped" -ForegroundColor Yellow
+    Write-Host "Final Statistics:" -ForegroundColor Cyan
+    Write-Host "  Total Pings:          $totalPings" -ForegroundColor White
+    Write-Host "  Total Failures:       $totalFailures" -ForegroundColor White
+    $finalRate = if ($totalPings -gt 0) { [math]::Round(($totalFailures / $totalPings) * 100, 2) } else { 0 }
+    Write-Host "  Failure Rate:         $finalRate%" -ForegroundColor White
+    Write-Host "  Consecutive Failures: $consecutiveFailures" -ForegroundColor White
+    Write-Host "===============================================" -ForegroundColor Cyan
+}
